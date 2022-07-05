@@ -77,7 +77,7 @@
         BuildOBJ() {
           let obj = '';
           obj += `mtllib ${this.name}.mtl\n`; // Set model library to use
-          obj += `o ${this.name}\n`; 			// Define model name
+          obj += `o ${this.name}\n`;       // Define model name
 
           for (let vI = 0; vI < this.vertex.length; vI += 3) {
             obj += 'v ';
@@ -238,6 +238,10 @@
       _TextureCache = new Map();
       _isCapturing = false;
       _needsToReset = false;
+
+      _GLShaderTypes = new Map();
+      _GLPatchedShaders = new Set();
+      _GLPatchedPrograms = new Set();
 
       constructor(gl) {
         this._GLContext = gl;
@@ -508,12 +512,51 @@
         }
       }
 
-      hooked_shaderSource(self, gl, args) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/shaderSource
-        let shader = args[0];
-        let source = args[1];
+      hooked_createShader(self, gl, [type], _createShader) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/createShader
+        if (!type)
+          return;
+
+        const shader = _createShader.apply(gl, [type])
+        self._GLShaderTypes.set(shader, type)
+        return shader
+      }
+
+      hooked_shaderSource(self, gl, [shader, source], _shaderSource) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/shaderSource
         if (!shader || !source)
           return;
-        //LogToParent("Got Shader: ", shader, source);
+
+        if (self._GLShaderTypes.get(shader) != gl.VERTEX_SHADER)
+          return;
+
+        const name = source.split("\n").filter(line => line.startsWith("#define SHADER_NAME"))[0]
+        if (!name || !name.includes("PBR_Opaque("))
+          return;
+        if(source.indexOf("vViewVertex = uModelViewMatrix * vec4(localVertex, 1.0);") < 0){
+          debugger;
+          return;
+        }
+
+        source = source.replace("uModelViewMatrix * vec4(localVertex, 1.0)", "uModelViewMatrix * vec4(localVertex, 1.0)")
+
+        LogToParent("Got Matching Vertex Shader: ", name);
+
+        self._GLPatchedShaders.add(shader)
+      }
+
+      hooked_attachShader(self, gl, [program, shader], _shaderSource) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/attachShader
+        if (!program || !shader)
+          return;
+
+        if (self._GLPatchedShaders.has(shader))
+          self._GLPatchedPrograms.add(program)
+      }
+
+      hooked_linkProgram(self, gl, [program], _shaderSource) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/linkProgram
+        if (!program)
+          return;
+
+        LogToParent("Adding transform feedback to", program)
+        gl.transformFeedbackVaryings(program, ["gl_Position"], gl.SEPARATE_ATTRIBS)
       }
 
       hooked_bindTexture(self, gl, args) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/bindTexture
@@ -527,11 +570,13 @@
         self._GLCurrentBoundTexture = texture;
       }
 
-      hooked_drawArrays(self, gl, args) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/drawArrays
+      hooked_drawArrays(self, gl, args, _drawArrays) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/drawArrays
         if (!self._isCapturing)
           return;
 
         LogToParent("Captured 'drawArrays' call: ", args);
+
+        return;
 
         let drawMode = args[0];
         let indFirst = args[1];
@@ -568,7 +613,7 @@
         LogToParent("Finished Building OBJ: ", builtOBJ);
       }
 
-      hooked_drawElements(self, gl, args) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/drawElements
+      hooked_drawElements(self, gl, args, _drawElements) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/drawElements
         if (!self._isCapturing)
           return;
         LogToParent("Captured 'drawElements' call: ", args);
@@ -591,24 +636,49 @@
 
         self.HelperFunc_UpdateAllAttributes(self, gl);
 
-        let _indOffset = indOffset / 2;
-
-        if (oIndicies instanceof ArrayBuffer)
-          oIndicies = new Uint8Array(oIndicies);
-
-        LogToParent("Using Indicies, size: ", oIndicies.length, ", to cut out from ", _indOffset, " to ", _indOffset, " + ", indCount);
-        let indicies = new Uint16Array(indCount);
-        for (let ind = 0; ind < indCount; ind++)
-          indicies[ind] = oIndicies[_indOffset + ind];
-        LogToParent("New indicies size: ", indicies.length);
-
         let textures = self.HelperFunc_GetAllTextures(self, gl);
+
+        let _CurrentProgram = self.HelperFunc_GetCurrentProgram(self, gl);
+
+        if (!self._GLPatchedPrograms.has(_CurrentProgram)) {
+          LogToParent("_CurrentProgram is not patched", _CurrentProgram);
+          return;
+        }
+
+        const feedbackBuffer = gl.createBuffer()
+        gl.bindBuffer(gl.ARRAY_BUFFER, feedbackBuffer)
+        gl.bufferData(gl.ARRAY_BUFFER, indCount * 3 * 4, gl.DYNAMIC_COPY)
+
+        gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, feedbackBuffer)
+        gl.beginTransformFeedback(gl.GL_TRIANGLES);
+        _drawElements.apply(gl, args);
+        gl.endTransformFeedback();
+
+        const verticiesRaw = new Float32Array(indCount * 3 * 4);
+        gl.getBufferSubData(gl.ARRAY_BUFFER, 0, verticiesRaw)
+
+        gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null)
+        gl.deleteBuffer(feedbackBuffer)
+
+        self._GLCurrentVerticies = new Float32Array(indCount * 3);
+        for (let i = 0; i < indCount; i++) {
+          self._GLCurrentVerticies[i * 3 + 0] = verticiesRaw[i * 4 + 0];
+          self._GLCurrentVerticies[i * 3 + 1] = verticiesRaw[i * 4 + 1];
+          self._GLCurrentVerticies[i * 3 + 2] = verticiesRaw[i * 4 + 2];
+        }
+
+        const indicies = new Uint16Array(indCount);
+        for (let i = 0; i < indCount; i++) {
+          indicies[i] = i
+        }
 
         let objPrimitives = new OBJUtils.OBJPrimitive(drawMode, indicies);
         let objID = self._CurrentModels.length;
         let builtOBJ = new OBJUtils.OBJModel(objPrimitives, self._GLCurrentVerticies, self._GLCurrentNormals, self._GLCurrentUVS, textures, `RIP${objID}`);
         self._CurrentModels.push(builtOBJ);
         LogToParent("Finished Building OBJ: ", builtOBJ);
+
+        return true;
       }
 
       hooked_drawRangeElements(self, gl, args) { // https://developer.mozilla.org/en-US/docs/Web/API/WebGL2RenderingContext/drawRangeElements
@@ -831,8 +901,9 @@
       }
       let originalFunc = _GL[_Method];
       _GL[_Method] = function () {
-        if (hookFunc(_RipperInterceptor, this, arguments))
-          return;
+        let retValue = hookFunc(_RipperInterceptor, this, arguments, originalFunc);
+        if (retValue)
+          return retValue;
         return originalFunc.apply(this, arguments);
       };
       hideHook(_GL[_Method], originalFunc);
@@ -848,6 +919,10 @@
       if (!isRequestingWebGL) {
         LogToParent("Got unsupported context: ", arguments[0]);
         return oFunc.apply(this, arguments);
+      }
+
+      if (arguments[0].toLowerCase() == "webgl") {
+        arguments[0] = "webgl2" // Hopefully this doesn't break everything
       }
 
       let gl = oFunc.apply(this, arguments);
@@ -869,7 +944,10 @@
         RegisterGLFunction(gl, glRipper, "vertexAttribPointer");
         RegisterGLFunction(gl, glRipper, "vertexAttribIPointer");
         RegisterGLFunction(gl, glRipper, "enableVertexAttribArray");
+        RegisterGLFunction(gl, glRipper, "createShader");
         RegisterGLFunction(gl, glRipper, "shaderSource");
+        RegisterGLFunction(gl, glRipper, "attachShader");
+        RegisterGLFunction(gl, glRipper, "linkProgram");
         RegisterGLFunction(gl, glRipper, "activeTexture");
         RegisterGLFunction(gl, glRipper, "bindTexture");
         RegisterGLFunction(gl, glRipper, "texImage2D");
